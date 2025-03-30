@@ -1,6 +1,4 @@
-// ============================================
-// 1. Configuration and Middleware
-// ============================================
+// server.js
 const express = require("express");
 const path = require("path");
 const multer = require("multer");
@@ -8,14 +6,36 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const { body, validationResult } = require("express-validator");
 require("dotenv").config();
-const pool = require("./database"); // <-- เชื่อมต่อไฟล์ database.js ของคุณ
+const pool = require("./database"); // ไฟล์เชื่อมต่อ MySQL ของคุณ
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-const saltRounds = 10;
 const port = process.env.PORT || 4000;
+const host = process.argv.includes('--host') ? process.argv[process.argv.indexOf('--host') + 1] : '0.0.0.0';
+
+// กำหนด saltRounds สำหรับ bcrypt
+const saltRounds = 10;
+
+// ============================================
+// 1. แก้ไข CORS (สำคัญ!)
+// ============================================
+
+// 1) เพิ่ม CORS middleware
+app.use(
+  cors({
+    origin: "https://horplus.work", // frontend ที่อนุญาต
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true, // ถ้าต้องการส่ง cookie/token ไปด้วย
+  })
+);
+
+// 2) รองรับ preflight request (OPTIONS) โดยอัตโนมัติ
+app.options("*", cors());
+
+// ============================================
+// 2. ตัวอย่าง Middleware อื่น ๆ
+// ============================================
+app.use(express.json());
 
 // Error Handling Middleware
 app.use((err, req, res, next) => {
@@ -23,6 +43,7 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
 });
 
+// ตั้งค่า Ping MySQL ทุก 5 นาที
 setInterval(async () => {
   try {
     const connection = await pool.getConnection();
@@ -32,10 +53,10 @@ setInterval(async () => {
   } catch (err) {
     console.error("❌ MySQL Ping Failed:", err);
   }
-}, 5 * 60 * 1000); // ทุก 5 นาที
+}, 5 * 60 * 1000);
 
 // ============================================
-// 2. File Upload (Multer) Setup
+// 3. File Upload (Multer) Setup
 // ============================================
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -50,7 +71,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// Endpoint: POST /api/upload
+// Endpoint อัปโหลดไฟล์
 app.post("/api/upload", upload.single("image"), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "ไม่พบไฟล์ที่ถูกอัปโหลด" });
@@ -69,14 +90,14 @@ app.post("/api/upload", upload.single("image"), (req, res) => {
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // ============================================
-// 2. Authentication APIs (Register, Login)
+// 4. Authentication APIs (Register, Login)
 // ============================================
 
 /*
   POST /api/register - สมัครสมาชิก
   1) สร้าง user ใหม่ (hash password)
-  2) สร้าง/อัปเดต rooms = 'occupied'
-  4) (ออปชัน) สร้างบิลเริ่มต้น (ถ้าต้องการ)
+  2) ตรวจสอบห้องว่ามีอยู่และว่างหรือไม่
+  3) หากมีการระบุ room_number ให้อัปเดตสถานะของห้องเป็น 'occupied'
 */
 app.post(
   "/api/register",
@@ -85,10 +106,7 @@ app.post(
     body("password")
       .isLength({ min: 6 })
       .withMessage("รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร"),
-    body("full_name").optional(),
-    body("phone_number").optional(),
-    body("role").optional(),
-    body("line_id").optional(),
+    // full_name, phone_number, line_id, role เป็น optional
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -96,32 +114,14 @@ app.post(
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const {
-      username,
-      password,
-      full_name,
-      phone_number,
-      line_id,
-      role, // ถ้าไม่ได้ส่งมา default = 'user'
-      room_number, // อาจไม่มีส่งมา
-    } = req.body;
+    const { username, password, full_name, phone_number, line_id, role, room_number } = req.body;
 
     try {
       let finalRoomNumber = room_number || null;
 
+      // หากระบุหมายเลขห้อง ให้ตรวจสอบว่ามีอยู่และว่างหรือไม่
       if (finalRoomNumber) {
-        // 1) ตรวจสอบห้องว่าว่างจริงหรือไม่
-        const [roomInUse] = await pool.query(
-          "SELECT * FROM rooms WHERE room_number = ? AND status = 'occupied'",
-          [finalRoomNumber]
-        );
-        if (roomInUse.length > 0) {
-          return res
-            .status(400)
-            .json({ error: `ห้องหมายเลข ${finalRoomNumber} ถูกใช้งานแล้ว` });
-        }
-
-        // 2) ตรวจสอบว่าห้องมีอยู่จริงหรือไม่
+        // ตรวจสอบห้องมีอยู่ในระบบหรือไม่
         const [roomExists] = await pool.query(
           "SELECT * FROM rooms WHERE room_number = ?",
           [finalRoomNumber]
@@ -131,9 +131,19 @@ app.post(
             .status(400)
             .json({ error: `ห้องหมายเลข ${finalRoomNumber} ไม่มีอยู่ในระบบ` });
         }
+        // ตรวจสอบว่าห้องนั้นถูกใช้งานอยู่หรือไม่ โดยดูจากผู้ใช้ที่มี room_number เดียวกัน
+        const [roomInUse] = await pool.query(
+          "SELECT * FROM users WHERE room_number = ?",
+          [finalRoomNumber]
+        );
+        if (roomInUse.length > 0) {
+          return res
+            .status(400)
+            .json({ error: `ห้องหมายเลข ${finalRoomNumber} ถูกใช้งานแล้ว` });
+        }
       }
 
-      // 3) สร้างผู้ใช้ใหม่ (Hash Password)
+      // เข้ารหัสรหัสผ่านด้วย bcrypt
       const hashedPassword = await bcrypt.hash(password, saltRounds);
       const [userInsert] = await pool.query(
         `INSERT INTO users 
@@ -151,7 +161,7 @@ app.post(
       );
       const userId = userInsert.insertId;
 
-      // 4) หากมีการระบุ room_number ให้อัปเดตสถานะของห้องเป็น 'occupied'
+      // หากมีการระบุหมายเลขห้อง ให้ปรับปรุงสถานะห้องเป็น 'occupied'
       if (finalRoomNumber) {
         await pool.query(
           "UPDATE rooms SET status = 'occupied' WHERE room_number = ?",
@@ -159,16 +169,13 @@ app.post(
         );
       }
 
-      return res.status(201).json({
-        message: "สมัครสมาชิกสำเร็จ",
-        userId: userId,
-      });
+      return res.status(201).json({ message: "สมัครสมาชิกสำเร็จ", userId });
     } catch (error) {
       console.error("Error adding new user:", error);
       if (error.code === "ER_DUP_ENTRY") {
-        return res.status(400).json({
-          error: `Duplicate entry for username '${username}'. สาเหตุอาจเกิดจากชื่อผู้ใช้นี้ถูกใช้งานแล้ว ทำให้ไม่สามารถสมัครสมาชิกได้ (Operation cancelled).`,
-        });
+        return res
+          .status(400)
+          .json({ error: `ชื่อผู้ใช้งาน '${username}' ซ้ำ กรุณาเลือกชื่ออื่น` });
       }
       return res.status(500).json({ error: "เกิดข้อผิดพลาดในการสมัครสมาชิก" });
     }
@@ -176,7 +183,7 @@ app.post(
 );
 
 /*
-  POST /api/login - เข้าสู่ระบบ
+  POST /api/login-admin - เข้าสู่ระบบ (สำหรับ admin)
 */
 app.post(
   "/api/login-admin",
@@ -233,7 +240,7 @@ app.post(
 );
 
 /*
-  POST /api/login - เข้าสู่ระบบ
+  POST /api/login - เข้าสู่ระบบ (สำหรับผู้ใช้งานทั่วไป)
 */
 app.post(
   "/api/login",
@@ -285,7 +292,7 @@ app.post(
 );
 
 // ============================================
-// 3. User APIs
+// 5. User APIs
 // ============================================
 
 /*
@@ -296,28 +303,29 @@ app.get("/api/users", async (req, res) => {
   try {
     const query = `
       SELECT 
-        u.user_id,
-        u.username,
-        u.full_name,
-        u.phone_number,
-        u.line_id,
-        u.role,
-        u.room_number,
-        (
-          SELECT IFNULL(SUM(b.total_amount), 0)
-          FROM bills b
-          WHERE b.room_number = u.room_number 
-            AND b.payment_state = 'unpaid'
+        user_id,
+        username,
+        full_name,
+        phone_number,
+        line_id,
+        room_number,
+        role,
+        created_at,
+        (SELECT IFNULL(SUM(b.total_amount), 0)
+         FROM bills b
+         WHERE b.room_number = users.room_number 
+           AND b.payment_state = 'unpaid'
         ) AS total_unpaid_amount
-      FROM users u
+      FROM users
     `;
     const [rows] = await pool.query(query);
     res.json(rows);
   } catch (error) {
-    console.error("Error fetching users with unpaid bills:", error);
-    res.status(500).json({ error: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
+    console.error("Error fetching users:", error);
+    res.status(500).json({ error: "เกิดข้อผิดพลาดในการดึงข้อมูลผู้ใช้" });
   }
 });
+
 
 /*
   GET /api/users/:user_id - ดึงข้อมูลผู้ใช้ (profile)
@@ -326,7 +334,7 @@ app.get("/api/users/:user_id", async (req, res) => {
   const { user_id } = req.params;
   try {
     const [rows] = await pool.query(
-      "SELECT user_id, username, full_name, phone_number, line_id, room_number, role FROM users WHERE user_id = ?",
+      "SELECT user_id, username, full_name, phone_number, line_id, room_number, role, created_at FROM users WHERE user_id = ?",
       [user_id]
     );
     if (rows.length === 0) {
@@ -335,7 +343,7 @@ app.get("/api/users/:user_id", async (req, res) => {
     res.json(rows[0]);
   } catch (error) {
     console.error("Error fetching user profile:", error);
-    res.status(500).json({ error: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
+    res.status(500).json({ error: "เกิดข้อผิดพลาดในการดึงข้อมูลผู้ใช้" });
   }
 });
 
@@ -348,11 +356,8 @@ app.put(
     body("username").notEmpty().withMessage("กรุณากรอกชื่อผู้ใช้"),
     body("room_number")
       .notEmpty()
-      .withMessage("กรุณาเลือกหรือระบุ room_number"),
-    body("full_name").optional(),
-    body("phone_number").optional(),
-    body("line_id").optional(),
-    body("role").optional(),
+      .withMessage("กรุณาระบุหมายเลขห้องที่พัก"),
+    // full_name, phone_number, line_id, role เป็น optional
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -361,65 +366,40 @@ app.put(
     }
 
     const { user_id } = req.params;
-    const {
-      username,
-      password,
-      full_name,
-      phone_number,
-      line_id,
-      role,
-      room_number,
-    } = req.body;
+    const { username, password, full_name, phone_number, line_id, role, room_number } = req.body;
 
     try {
-      // ตรวจสอบ user เดิม
-      const [currentUser] = await pool.query(
-        "SELECT * FROM users WHERE user_id = ?",
-        [user_id]
-      );
-      if (currentUser.length === 0) {
+      // ตรวจสอบข้อมูลผู้ใช้เดิม
+      const [currentUserRows] = await pool.query("SELECT * FROM users WHERE user_id = ?", [user_id]);
+      if (currentUserRows.length === 0) {
         return res.status(404).json({ error: "ไม่พบผู้ใช้ที่ต้องการแก้ไข" });
       }
-      const oldRoomId = currentUser[0].room_number;
+      const currentUser = currentUserRows[0];
+      const oldRoom = currentUser.room_number;
 
-      // ตรวจสอบว่าห้องใหม่มีผู้ใช้อื่นอยู่หรือไม่ (กรณี 1 ห้องมีได้คนเดียว)
+      // ตรวจสอบว่าห้องใหม่มีผู้ใช้อื่นอยู่หรือไม่
       const [roomOccupied] = await pool.query(
         "SELECT * FROM users WHERE room_number = ? AND user_id != ?",
         [room_number, user_id]
       );
       if (roomOccupied.length > 0) {
-        return res
-          .status(400)
-          .json({ error: "room_number นี้ถูกใช้งานแล้วโดยผู้ใช้อื่น" });
+        return res.status(400).json({ error: "หมายเลขห้องนี้ถูกใช้งานแล้ว" });
       }
 
-      // อัปเดตสถานะห้องเก่าเป็น available ถ้า room_number เปลี่ยน
-      if (oldRoomId && oldRoomId !== room_number) {
-        await pool.query(
-          "UPDATE rooms SET status = 'available' WHERE room_number = ?",
-          [oldRoomId]
-        );
+      // หากมีการเปลี่ยนแปลงห้อง ให้ปรับสถานะห้องเก่าเป็น available
+      if (oldRoom && oldRoom !== room_number) {
+        await pool.query("UPDATE rooms SET status = 'available' WHERE room_number = ?", [oldRoom]);
       }
-
-      // เพิ่ม/อัปเดต rooms สำหรับห้องใหม่
-      const [roomExists] = await pool.query(
-        "SELECT * FROM rooms WHERE room_number = ?",
-        [room_number]
-      );
+      // ตรวจสอบว่าห้องใหม่มีอยู่ในระบบหรือไม่
+      const [roomExists] = await pool.query("SELECT * FROM rooms WHERE room_number = ?", [room_number]);
       if (roomExists.length === 0) {
-        await pool.query(
-          "INSERT INTO rooms (room_number, room_number, size, rent, status) VALUES (?, ?, ?, ?, ?)",
-          [room_number, `Room-${room_number}`, "Standard", 1000, "occupied"]
-        );
+        return res.status(400).json({ error: `ห้องหมายเลข ${room_number} ไม่มีอยู่ในระบบ` });
       } else {
-        await pool.query(
-          "UPDATE rooms SET status = 'occupied' WHERE room_number = ?",
-          [room_number]
-        );
+        await pool.query("UPDATE rooms SET status = 'occupied' WHERE room_number = ?", [room_number]);
       }
 
-      // อัปเดต users
-      let updateUserSql = `
+      // สร้างคำสั่ง UPDATE สำหรับผู้ใช้
+      let updateSql = `
         UPDATE users
         SET username = ?,
             full_name = ?,
@@ -433,73 +413,62 @@ app.put(
         full_name || null,
         phone_number || null,
         line_id || null,
-        role || null,
+        role || "user",
         room_number,
       ];
 
+      // หากมีการส่งรหัสผ่านมา ให้เข้ารหัสและอัปเดต
       if (password) {
+        if (password.length < 6) {
+          return res.status(400).json({ error: "รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร" });
+        }
         const hashedPassword = await bcrypt.hash(password, saltRounds);
-        updateUserSql += ", password = ?";
+        updateSql += ", password = ?";
         params.push(hashedPassword);
       }
-      updateUserSql += " WHERE user_id = ?";
+      updateSql += " WHERE user_id = ?";
       params.push(user_id);
 
-      const [result] = await pool.query(updateUserSql, params);
+      const [result] = await pool.query(updateSql, params);
       if (result.affectedRows === 0) {
         return res.status(404).json({ error: "ไม่พบผู้ใช้ที่ต้องการแก้ไข" });
       }
-
-      res.status(200).json({ message: "แก้ไขข้อมูลผู้ใช้สำเร็จ" });
+      res.json({ message: "แก้ไขข้อมูลผู้ใช้เรียบร้อยแล้ว" });
     } catch (error) {
       console.error("Error updating user:", error);
-      res.status(500).json({ error: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
+      if (error.code === "ER_DUP_ENTRY") {
+        return res.status(400).json({ error: `ชื่อผู้ใช้งาน '${username}' ซ้ำ กรุณาเลือกชื่ออื่น` });
+      }
+      res.status(500).json({ error: "เกิดข้อผิดพลาดในการแก้ไขข้อมูลผู้ใช้" });
     }
   }
 );
 
 /*
-  DELETE /api/users/:user_id - ลบผู้ใช้
-  - ตัวอย่างนี้ลบ rooms ที่เกี่ยวข้องด้วย (ตามโค้ดเดิม)
+  DELETE /api/users/:user_id - ลบผู้ใช้ (และอัปเดตสถานะห้องให้เป็น available)
 */
 app.delete("/api/users/:user_id", async (req, res) => {
   const { user_id } = req.params;
   try {
-    const [userExists] = await pool.query(
-      "SELECT * FROM users WHERE user_id = ?",
-      [user_id]
-    );
-    if (userExists.length === 0) {
-      return res.status(404).json({ msg: "ไม่พบผู้ใช้ที่ต้องการลบ" });
+    const [userRows] = await pool.query("SELECT * FROM users WHERE user_id = ?", [user_id]);
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: "ไม่พบผู้ใช้ที่ต้องการลบ" });
     }
-    const room_number = userExists[0].room_number;
-
-    // ลบผู้ใช้
-    const [deleteUserResult] = await pool.query(
-      "DELETE FROM users WHERE user_id = ?",
-      [user_id]
-    );
-    if (deleteUserResult.affectedRows > 0) {
-      // ตัวอย่าง: ลบห้องด้วย (หากต้องการเก็บไว้ ให้เปลี่ยนเป็น UPDATE status='available')
-      if (room_number) {
-        await pool.query(
-          "UPDATE rooms SET status = 'available' WHERE room_number = ?",
-          [room_number]
-        );
-      }
-
-      res.status(200).json({ message: "ลบผู้ใช้และห้องที่เกี่ยวข้องสำเร็จ" });
-    } else {
-      res.status(500).json({ error: "เกิดข้อผิดพลาดในการลบผู้ใช้" });
+    const room_number = userRows[0].room_number;
+    const [result] = await pool.query("DELETE FROM users WHERE user_id = ?", [user_id]);
+    if (result.affectedRows > 0 && room_number) {
+      // เปลี่ยนสถานะห้องกลับเป็น available หากผู้ใช้ที่มีห้องถูกลบออก
+      await pool.query("UPDATE rooms SET status = 'available' WHERE room_number = ?", [room_number]);
     }
+    res.json({ message: "ลบผู้ใช้เรียบร้อยแล้ว" });
   } catch (error) {
     console.error("Error deleting user:", error);
-    res.status(500).json({ error: "เกิดข้อผิดพลาดในเซิร์ฟเวอร์" });
+    res.status(500).json({ error: "เกิดข้อผิดพลาดในการลบผู้ใช้" });
   }
 });
 
 // ============================================
-// 4. Bill & Payment APIs
+// 6. Bill & Payment APIs
 // ============================================
 
 /*
@@ -587,10 +556,9 @@ app.post("/api/bills", async (req, res) => {
       return res.status(400).json({ msg: `ไม่พบห้องหมายเลข ${room_number}` });
     }
     // ดึง rent
-    const rentAmount = roomRows[0].rent; // เช่น 2300.00
+    const rentAmount = roomRows[0].rent;
 
     // 2) บันทึกบิล ลงในตาราง bills
-    // สมมติว่าตาราง bills มีคอลัมน์ rent_amount ให้เก็บค่าเช่าห้อง
     const sql = `
         INSERT INTO bills (
           user_id, 
@@ -613,7 +581,7 @@ app.post("/api/bills", async (req, res) => {
       electricity_units,
       water_rate,
       electricity_rate,
-      rentAmount, // ใส่ rent ที่ดึงมาจาก rooms
+      rentAmount,
       due_date,
       meter,
     ]);
@@ -635,9 +603,9 @@ app.put("/api/bills/:id", async (req, res) => {
   const { id } = req.params;
   const {
     slip_path,
+    meter, // รับค่า meter จาก request ด้วย
     payment_state,
     paid_date,
-    user_id,
     water_units,
     electricity_units,
     due_date,
@@ -655,8 +623,8 @@ app.put("/api/bills/:id", async (req, res) => {
     const oldBill = oldRows[0];
 
     // 2) สร้างตัวแปรที่รวมค่าของเก่า + ของใหม่
-    // ถ้าของใหม่ไม่มี (undefined/null) -> ใช้ของเก่า
     const newSlipPath = slip_path !== undefined ? slip_path : oldBill.slip_path;
+    const newMeter = meter !== undefined ? meter : oldBill.meter; // เพิ่มฟิลด์ meter
     const newPaymentState =
       payment_state !== undefined ? payment_state : oldBill.payment_state;
     const newPaidDate = paid_date !== undefined ? paid_date : oldBill.paid_date;
@@ -668,10 +636,11 @@ app.put("/api/bills/:id", async (req, res) => {
         : oldBill.electricity_units;
     const newDueDate = due_date !== undefined ? due_date : oldBill.due_date;
 
-    // 3) อัปเดตด้วยค่าใหม่
+    // 3) อัปเดตข้อมูลบิลด้วยค่าใหม่ (รวม meter ด้วย)
     const updateSql = `
         UPDATE bills
         SET slip_path = ?,
+            meter = ?,
             payment_state = ?,
             paid_date = ?,
             water_units = ?,
@@ -681,6 +650,7 @@ app.put("/api/bills/:id", async (req, res) => {
       `;
     const [updateResult] = await pool.query(updateSql, [
       newSlipPath,
+      newMeter,
       newPaymentState,
       newPaidDate,
       newWaterUnits,
@@ -693,9 +663,8 @@ app.put("/api/bills/:id", async (req, res) => {
       return res.status(404).json({ error: "ไม่พบบิลที่ต้องการอัปเดต" });
     }
 
-    // ถ้าปรับ payment_state => 'paid' => เพิ่ม payment_history
+    // ถ้า payment_state เปลี่ยนเป็น 'paid' ให้บันทึกลงใน payment_history
     if (newPaymentState === "paid") {
-      // ... (เหมือนเดิม)
       const [billRows] = await pool.query(
         "SELECT total_amount FROM bills WHERE bill_id = ?",
         [id]
@@ -724,6 +693,7 @@ app.put("/api/bills/:id", async (req, res) => {
     return res.status(500).json({ error: "เกิดข้อผิดพลาดในการอัปเดตบิล" });
   }
 });
+
 
 /*
   DELETE /api/bills/:id - ลบบิล
@@ -851,7 +821,7 @@ app.get("/api/payment_history/:userId", async (req, res) => {
 });
 
 // ============================================
-// 5. Repairs APIs
+// 7. Repairs APIs
 // ============================================
 
 /*
@@ -859,7 +829,6 @@ app.get("/api/payment_history/:userId", async (req, res) => {
 */
 app.get("/api/repairs", async (req, res) => {
   try {
-    // ดึงรายการแจ้งซ่อมทั้งหมด จากตาราง repairs เท่านั้น
     const query = `
         SELECT 
           repair_id, 
@@ -867,30 +836,23 @@ app.get("/api/repairs", async (req, res) => {
           room_number, 
           description, 
           status, 
+          created_at,
           repair_date
         FROM repairs
       `;
-
     const [rows] = await pool.query(query);
-
-    // ถ้าไม่พบข้อมูล อาจส่งเป็น [] ว่าง หรือ 404 ก็ได้
     if (rows.length === 0) {
       return res.json([]);
     }
-
-    // ตัวอย่าง: แปลงสถานะ (ภาษาอังกฤษ) เป็นภาษาไทย
     const statusTranslations = {
       pending: "รอรับเรื่อง",
       "in progress": "กำลังดำเนินการ",
       complete: "เสร็จสิ้น",
     };
-
     const translatedRows = rows.map((row) => ({
       ...row,
       status: statusTranslations[row.status] || row.status,
     }));
-
-    // ส่งข้อมูลกลับ
     res.json(translatedRows);
   } catch (error) {
     console.error("Error fetching repairs:", error);
@@ -899,10 +861,8 @@ app.get("/api/repairs", async (req, res) => {
 });
 
 app.get("/api/repairs/:user_id", async (req, res) => {
-  const { user_id } = req.params; // ดึง user_id จาก URL Params
-
+  const { user_id } = req.params;
   try {
-    // สร้างคำสั่ง SQL เพื่อเลือกข้อมูลเฉพาะที่ user_id ตรงกับที่ส่งมา
     const query = `
         SELECT 
           repair_id,
@@ -910,30 +870,24 @@ app.get("/api/repairs/:user_id", async (req, res) => {
           room_number,
           description,
           status,
+          created_at,
           repair_date
         FROM repairs
         WHERE user_id = ?
       `;
-
-    // ส่ง [user_id] เป็น array ให้ query ใช้แทนเครื่องหมาย ?
     const [rows] = await pool.query(query, [user_id]);
-
     if (rows.length === 0) {
-      return res.json([]); // หรือจะส่ง 404 ก็ได้ แต่ส่ง [] ก็สมเหตุสมผล
+      return res.json([]);
     }
-
-    // แปลงสถานะเป็นภาษาไทย (ถ้าต้องการ)
     const statusTranslations = {
       pending: "รอรับเรื่อง",
       "in progress": "กำลังดำเนินการ",
       complete: "เสร็จสิ้น",
     };
-
     const translatedRows = rows.map((row) => ({
       ...row,
       status: statusTranslations[row.status] || row.status,
     }));
-
     res.json(translatedRows);
   } catch (error) {
     console.error("Error fetching repairs:", error);
@@ -952,9 +906,7 @@ app.post("/api/repairs", async (req, res) => {
     });
   }
 
-  // สมมติ front-end ส่งสถานะมาเป็นภาษาไทย => แปลงเป็นอังกฤษ
-  let repairStatus = "pending"; // default
-
+  let repairStatus = "pending";
   if (status === "รอดำเนินการ") {
     repairStatus = "pending";
   } else if (status === "กำลังดำเนินการ") {
@@ -964,7 +916,6 @@ app.post("/api/repairs", async (req, res) => {
   }
 
   try {
-    // ตรวจสอบผู้ใช้
     const [userCheck] = await pool.query(
       "SELECT * FROM users WHERE user_id = ?",
       [user_id]
@@ -972,7 +923,6 @@ app.post("/api/repairs", async (req, res) => {
     if (userCheck.length === 0) {
       return res.status(404).json({ error: "ไม่พบผู้ใช้งานที่ระบุ" });
     }
-    // ตรวจสอบห้อง
     const [roomCheck] = await pool.query(
       "SELECT * FROM rooms WHERE room_number = ?",
       [room_number]
@@ -1045,7 +995,7 @@ app.delete("/api/repairs/:repair_id", async (req, res) => {
 });
 
 // ============================================
-// 6. Announcement APIs
+// 8. Announcement APIs
 // ============================================
 
 /*
@@ -1187,16 +1137,13 @@ app.get("/api/rooms-by-status", async (req, res) => {
 app.post("/api/rooms", async (req, res) => {
   const { room_number, rent, description, status } = req.body;
 
-  // ตรวจสอบว่ามี room_number และ rent หรือไม่
   if (!room_number || !rent) {
     return res.status(400).json({ error: "กรุณาระบุหมายเลขห้องและค่าเช่า" });
   }
 
-  // กำหนดค่าสูงสุดที่อนุญาตสำหรับ rent
-  const maxRent = 99999999; // ปรับได้ตามขีดจำกัดของคุณ
+  const maxRent = 99999999;
   const parsedRent = parseFloat(rent);
 
-  // ตรวจสอบว่า rent มีค่าเป็นบวกและไม่เกินค่าสูงสุดที่กำหนด
   if (parsedRent < 0 || parsedRent > maxRent) {
     return res
       .status(400)
@@ -1204,7 +1151,6 @@ app.post("/api/rooms", async (req, res) => {
   }
 
   try {
-    // ตรวจสอบว่าห้องหมายเลขซ้ำหรือไม่
     const [existingRoom] = await pool.query(
       "SELECT * FROM rooms WHERE room_number = ?",
       [room_number]
@@ -1215,7 +1161,6 @@ app.post("/api/rooms", async (req, res) => {
         .json({ error: `ห้องหมายเลข ${room_number} มีอยู่แล้ว` });
     }
 
-    // เพิ่มห้องใหม่ลงในฐานข้อมูล
     const [result] = await pool.query(
       "INSERT INTO rooms (room_number, rent, description, status) VALUES (?, ?, ?, ?)",
       [room_number, parsedRent, description || "", status || "available"]
@@ -1231,12 +1176,10 @@ app.post("/api/rooms", async (req, res) => {
 });
 
 // 🚀 **PUT: อัปเดตข้อมูลห้อง**
-// 🚀 **PUT: อัปเดตข้อมูลห้อง**
 app.put("/api/rooms/:room_id", async (req, res) => {
   const { room_id } = req.params;
   const { room_number, rent, description, status } = req.body;
 
-  // ตรวจสอบว่ามี room_number และ rent หรือไม่
   if (!room_number || !rent) {
     return res.status(400).json({ error: "กรุณาระบุหมายเลขห้องและค่าเช่า" });
   }
@@ -1250,7 +1193,6 @@ app.put("/api/rooms/:room_id", async (req, res) => {
   }
 
   try {
-    // ตรวจสอบว่าห้องนี้มีอยู่จริงหรือไม่
     const [roomExists] = await pool.query(
       "SELECT * FROM rooms WHERE room_id = ?",
       [room_id]
@@ -1259,7 +1201,6 @@ app.put("/api/rooms/:room_id", async (req, res) => {
       return res.status(404).json({ error: "ไม่พบห้องที่ต้องการแก้ไข" });
     }
 
-    // ตรวจสอบว่าหมายเลขห้องซ้ำหรือไม่ (ยกเว้นห้องที่กำลังแก้ไขอยู่)
     const [duplicateCheck] = await pool.query(
       "SELECT * FROM rooms WHERE room_number = ? AND room_id != ?",
       [room_number, room_id]
@@ -1270,7 +1211,6 @@ app.put("/api/rooms/:room_id", async (req, res) => {
         .json({ error: `ห้องหมายเลข ${room_number} มีอยู่แล้ว` });
     }
 
-    // อัปเดตข้อมูลห้อง
     await pool.query(
       "UPDATE rooms SET room_number = ?, rent = ?, description = ?, status = ? WHERE room_id = ?",
       [
@@ -1307,8 +1247,8 @@ app.delete("/api/rooms/:room_id", async (req, res) => {
 });
 
 // ============================================
-// 7. Start Server
+// 9. Start Server
 // ============================================
-app.listen(port, () => {
-  console.log(`เซิร์ฟเวอร์กำลังทำงานที่พอร์ต ${port}`);
+app.listen(port, host, () => {
+  console.log(`เซิร์ฟเวอร์กำลังทำงานที่ ${host}:${port} (IPv4)`);
 });
